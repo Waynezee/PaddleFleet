@@ -48,8 +48,10 @@ def judge_machine_type():
     models = get_gpu_models_via_nvidia_smi()
     if paddle.device.get_device_capability()[0] == 9:
         return "H"
+    elif paddle.device.get_device_capability()[0] == 10:
+        return "B"
     else:
-        return "V"
+        assert 0, "unsupported machine type"
 
 
 result = judge_machine_type()
@@ -154,11 +156,11 @@ class TestGPTModel(unittest.TestCase):
         # Define expected values for different configurations on different machines
         expectations = {
             "config_1": {
-                "H": {
-                    "loss": 5.3251447677612305,
-                    "grad_norm": 5.3691630363464355,
+                "B": {
+                    "loss": 5.436403274536133,
+                    "grad_norm": 4.756999492645264,
                 },
-                "V": {
+                "H": {
                     "loss": 5.3251447677612305,
                     "grad_norm": 5.3691630363464355,
                 },
