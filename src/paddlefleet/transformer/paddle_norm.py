@@ -43,6 +43,19 @@ if TYPE_CHECKING:
     from paddlefleet.transformer import TransformerConfig
 
 
+def print_grad(forward_name, message=""):
+    def _print_grad(grad):
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {grad.shape} {grad.dtype} {grad._md5sum()}")
+    return _print_grad
+
+
+def print_tensor(message="", x=None):
+    print(f"\nprint_tensor {x.name}")
+    print(f"[local  {message}] {x.shape} {x.dtype} {x._md5sum()} norm={x.norm().item()} max={x.abs().max().item()} sum={x.sum().item()}")
+    x.register_hook(print_grad(x.name, message))
+
+
 class RMSNorm(paddle.nn.Layer):
     def __init__(
         self,
@@ -76,6 +89,7 @@ class RMSNorm(paddle.nn.Layer):
         # Ensure hidden_states dtype matches weight dtype for rms_norm
         if hidden_states.dtype != self.weight.dtype:
             hidden_states = hidden_states.astype(self.weight.dtype)
+        # print_tensor(message=f"{self.__class__.__name__}_input", x=hidden_states)
         rms_norm_out = rms_norm(
             hidden_states,
             hidden_states.shape[-1:],
@@ -83,9 +97,11 @@ class RMSNorm(paddle.nn.Layer):
             self.variance_epsilon,
         )
         if isinstance(rms_norm_out, (tuple, list)):
-            return rms_norm_out[0].astype(self.weight.dtype)
+            out = rms_norm_out[0].astype(self.weight.dtype)
         else:
-            return rms_norm_out.astype(self.weight.dtype)
+            out = rms_norm_out.astype(self.weight.dtype)
+        # print_tensor(message=f"{self.__class__.__name__}_output", x=out)
+        return out
 
     def enable_sequence_parallel(self):
         mark_as_sequence_parallel_parameter(self.weight)
@@ -255,7 +271,7 @@ class WrappedPaddleNormPipe(paddle.nn.Layer):
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0
             and not self.config.mtp_load_weight_only
-            and not self.config.enable_mtp_magic_send
+            # and not self.config.enable_mtp_magic_send
         ):
             hidden_states_concat = dict_args["hidden_states"]
             tensor_list = paddle.split(
@@ -270,7 +286,7 @@ class WrappedPaddleNormPipe(paddle.nn.Layer):
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0
             and not self.config.mtp_load_weight_only
-            and not self.config.enable_mtp_magic_send
+            # and not self.config.enable_mtp_magic_send
         ):
             # normalize MTP hidden_states
             if self.config.gpt_model_use_experimental_version:

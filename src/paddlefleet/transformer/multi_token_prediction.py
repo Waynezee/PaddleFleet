@@ -535,16 +535,23 @@ class MultiTokenPredictionLayer(FleetLayer):
                     )
 
                 # when sp enable
+                from ernie_core.models.sequence_parallel_utils import ScatterOp
                 if self.sequence_parallel:
+                    mtp_hidden_inputs_mask = mtp_hidden_inputs_mask.reshape([-1, 1])
+                    mtp_hidden_inputs_mask = ScatterOp.apply(mtp_hidden_inputs_mask)
                     # [B, S/CP, 1] -> [S/CP, B, 1]
-                    mtp_hidden_inputs_mask = mtp_hidden_inputs_mask.transpose(
-                        [1, 0, 2]
-                    )
-                    mtp_hidden_inputs_mask = (
-                        scatter_to_sequence_parallel_region(
-                            mtp_hidden_inputs_mask
-                        )
-                    )
+                    # mtp_hidden_inputs_mask = mtp_hidden_inputs_mask.transpose(
+                    #     [1, 0, 2]
+                    # )
+                    # mtp_hidden_inputs_mask = (
+                    #     scatter_to_sequence_parallel_region(
+                    #         mtp_hidden_inputs_mask
+                    #     )
+                    # )
+                    # mtp_hidden_inputs_mask = mtp_hidden_inputs_mask.transpose(
+                    #     [1, 0, 2]
+                    # )
+                    # mtp_hidden_inputs_mask = mtp_hidden_inputs_mask.reshape([-1, 1])
                 hidden_states = hidden_states * mtp_hidden_inputs_mask
             # At the (k - 1)-th MTP layer, concatenates the i-th token's hidden_states
             # and the (i + K)-th token's embedding, and combine them with linear projection.
@@ -597,7 +604,6 @@ class MultiTokenPredictionLayer(FleetLayer):
             hidden_states = self._concat_embeddings(
                 hidden_states, decoder_input, mtp_hidden_inputs_mask
             )
-
             input_dict = {
                 "hidden_states": hidden_states,
                 "attention_mask": attention_mask,
@@ -799,11 +805,11 @@ class MultiTokenPredictionLayer(FleetLayer):
                     [-1, decoder_input.shape[-1]]
                 )
                 decoder_input = ScatterOp.apply(decoder_input)
-                decoder_input = (
-                    decoder_input.reshape([batch_size, -1, hidden_size])
-                    .permute(1, 0, 2)
-                    .contiguous()
-                )  # [S/tp, B, H]
+                # decoder_input = (
+                #     decoder_input.reshape([batch_size, -1, hidden_size])
+                #     .permute(1, 0, 2)
+                #     .contiguous()
+                # )  # [S/tp, B, H]
 
             # Pop auxiliary data
             origin_start_row_indices = dict_args.pop(

@@ -28,6 +28,17 @@ from paddlefleet.tensor_parallel.layers import (
 )
 from paddlefleet.transformer.identity_op import IdentityOp
 
+def print_tensor(message="", x=None):   
+    pass
+    # print(f"\nprint_tensor {x.name}")
+    # print(f"[local  {message}] {x.shape} {x.dtype} {x._md5sum()} norm={x.norm().item()} max={x.abs().max().item()} sum={x.sum().item()}")
+    # x.register_hook(print_grad(x.name, message))
+
+def print_grad(forward_name, message=""):
+    def _print_grad(grad):
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {grad.shape} {grad.dtype} {grad._md5sum()} norm={grad.norm().item()} max={grad.abs().max().item()} sum={grad.sum().item()}")
+    return _print_grad
 
 class GPTLMHead(ColumnParallelLinear):
     def __init__(self, **kwargs):
@@ -124,8 +135,8 @@ class GPTLMHead(ColumnParallelLinear):
             logits = recompute_handler(hidden_states, self.weight.T)
         else:
             logits, _ = super().forward(hidden_states, self.weight.T)
-        if self.config.sequence_parallel:
-            logits = logits.transpose([1, 0, 2]).contiguous()
+        # if self.config.sequence_parallel:
+        #     logits = logits.transpose([1, 0, 2]).contiguous()
 
         # Loss-path MD5 probe: lm_head weight and logits
         import os
@@ -178,9 +189,13 @@ class GPTLMHead(ColumnParallelLinear):
                 hidden_states,
                 self.config.num_nextn_predict_layers + 1,
             )
+            print_tensor("[wxz debug] main logits: ", tensor_list[0])
             logits = [self._forward(tensor_list[0])]
             for i in range(self.config.num_nextn_predict_layers):
+                print_tensor("[wxz debug] mtp logits: ", tensor_list[i + 1])
                 logits.append(self._forward(tensor_list[i + 1]))
+            print("[wxz debug] main output logits: ", logits[0]._md5sum())
+            print("[wxz debug] mtp output logits: ", logits[1]._md5sum())
             return logits
         else:
             return self._forward(hidden_states)

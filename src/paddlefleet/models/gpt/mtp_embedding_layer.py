@@ -35,7 +35,10 @@ if TYPE_CHECKING:
 # Populated by DistDataLoader.__next__() after broadcast,
 # consumed by MTPEmbeddingLayer.forward() via popleft().
 input_ids_for_mtp = deque()
-
+from paddlefleet.context_parallel_utils import (
+    ContextParallelScatterOp,
+    mark_context_parallel_parameter_disable_scale_grad,
+)
 
 class MTPEmbeddingLayer(FleetLayer):
     """MTP re-embedding layer for magic send mechanism.
@@ -62,6 +65,9 @@ class MTPEmbeddingLayer(FleetLayer):
             init_method=config.embedding_init_method,
             reduce_scatter_embeddings=False,  # MTP does not need SP scatter
             config=no_init_config,
+        )
+        mark_context_parallel_parameter_disable_scale_grad(
+            self.embed_tokens
         )
 
     @property

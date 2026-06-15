@@ -62,6 +62,17 @@ try:
 except ImportError:
     _grad_accum_fusion_available = False
 
+def print_tensor(message="", x=None):  
+    pass  
+    # print(f"\nprint_tensor {x.name}")
+    # print(f"[local  {message}] {x.shape} {x.dtype} {x._md5sum()} norm={x.norm().item()} max={x.abs().max().item()} sum={x.sum().item()}")
+    # x.register_hook(print_grad(x.name, message))
+
+def print_grad(forward_name, message=""):
+    def _print_grad(grad):
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {grad.shape} {grad.dtype} {grad._md5sum()} norm={grad.norm().item()} max={grad.abs().max().item()} sum={grad.sum().item()}")
+    return _print_grad
 
 HAVE_TE = False
 
@@ -247,6 +258,7 @@ class VocabParallelEmbedding(paddle.nn.Layer):
             self.vocab_end_index - self.vocab_start_index
         )
         self.deterministic_mode = config.deterministic_mode
+        self.config = config
         self.world_size = get_pg_size(self.tp_group)
 
         # Allocate weights and initialize.
@@ -288,6 +300,15 @@ class VocabParallelEmbedding(paddle.nn.Layer):
         Args:
             input_ (paddle.Tensor): Input tensor.
         """
+        if getattr(self.config, "gpt_model_use_experimental_version", False):
+            return vocab_parallel_embedding(
+                input_,
+                self.weight,
+                vocab_start_index=self.vocab_start_index,
+                num_embeddings=self.num_embeddings,
+                mp_group=self.tp_group,
+            )
+
         if get_pg_size(self.tp_group) > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | (
@@ -1032,6 +1053,125 @@ class Linear(paddle.nn.Layer):
             f"out_features={self.output_size}, bias={use_bias}, TP=1)"
         )
 
+def column_sequence_parallel_linear(
+    x,
+    weight,
+    bias=None,
+    mp_group=None,
+):
+    """Functional version of ColumnSequenceParallelLinear using fused_linear.
+
+    Forward: all-gather input along seq dim -> fused_linear.
+    Input shape: [seq/mp, batch, hidden], output shape: [seq, batch, hidden/mp].
+
+    Args:
+        x: Input tensor (sequence-parallel partitioned).
+        weight: Weight tensor, shape [in_features, out_features_per_partition].
+        bias: Bias tensor, shape [out_features_per_partition], or None.
+        mp_group: Tensor parallel process group.
+
+    Returns:
+        Output tensor.
+    """
+    from paddle.incubate.nn.functional import fused_linear
+
+    from ernie_core.models.sequence_parallel_utils import AllGatherOp
+
+    is_mp = mp_group is not None and mp_group.nranks > 1
+
+    if is_mp:
+        input_parallel = AllGatherOp.apply(x, 0, mp_group)
+    else:
+        input_parallel = x
+
+    output = fused_linear(input_parallel, weight, bias)
+    return output
+
+
+def row_sequence_parallel_linear(
+    x,
+    weight,
+    bias=None,
+    mp_group=None,
+):
+    """Functional version of RowSequenceParallelLinear using fused_linear.
+
+    Forward: fused_linear -> reduce-scatter along seq dim.
+    Input shape: [seq, batch, hidden/mp], output shape: [seq/mp, batch, hidden].
+
+    Args:
+        x: Input tensor (already column-parallel partitioned).
+        weight: Weight tensor, shape [in_features_per_partition, out_features].
+        bias: Bias tensor, shape [out_features], or None.
+        mp_group: Tensor parallel process group.
+
+    Returns:
+        Output tensor.
+    """
+    from paddle.incubate.nn.functional import fused_linear
+
+    from ernie_core.models.sequence_parallel_utils import ReduceScatterOp
+
+    is_mp = mp_group is not None and mp_group.nranks > 1
+
+    if is_mp:
+        output_parallel = fused_linear(x, weight, None)
+        output_ = ReduceScatterOp.apply(output_parallel, mp_group)
+        if bias is not None:
+            output = output_ + bias
+        else:
+            output = output_
+    else:
+        output = fused_linear(x, weight, bias)
+
+    return output
+
+
+def vocab_parallel_embedding(
+    input_,
+    weight,
+    vocab_start_index,
+    num_embeddings,
+    mp_group=None,
+):
+    """Functional version of VocabParallelEmbedding.
+
+    Uses _c_lookup_table + _mp_allreduce (same as paddle fleet mp_layers).
+
+    Args:
+        input_: Input token ids tensor.
+        weight: Embedding weight, shape [num_embeddings_per_partition, embedding_dim].
+        vocab_start_index: Start index of the vocab partition on this rank.
+        num_embeddings: Total vocabulary size.
+        mp_group: Tensor parallel process group.
+
+    Returns:
+        Output embedding tensor.
+    """
+    from paddle.distributed.fleet.layers.mpu import mp_ops
+
+    is_mp = mp_group is not None and mp_group.nranks > 1
+
+    if is_mp:
+        output_parallel = mp_ops._c_lookup_table(
+            weight,
+            input_,
+            start_index=vocab_start_index,
+            vocab_size=num_embeddings,
+        )
+        print_tensor("[wxz debug] vocab_parallel_embedding output_parallel: ", output_parallel)
+        output = mp_ops._mp_allreduce(
+            output_parallel,
+            group=mp_group,
+            use_calc_stream=True,
+            use_model_parallel=True,
+        )
+        print_tensor("[wxz debug] vocab_parallel_embedding output: ", output)
+    else:
+        output = F.embedding(input_, weight=weight)
+
+    return output
+
 
 class ColumnParallelLinear(paddle.nn.Layer):
     """Linear layer with column parallelism.
@@ -1260,20 +1400,11 @@ class ColumnParallelLinear(paddle.nn.Layer):
 
         bias = self.bias if not self.skip_bias_add else None
 
-        if (
-            getattr(self.config, "gpt_model_use_experimental_version", False)
-            and self.world_size == 1
-            and self.bias is not None
-        ):
-            output = paddle.incubate.nn.functional.fused_linear(
-                input_, weight, self.bias
+        if getattr(self.config, "gpt_model_use_experimental_version", False):
+            output = column_sequence_parallel_linear(
+                input_, weight, self.bias, mp_group=self.tp_group
             )
-            output_bias = (
-                self.bias.clone()
-                if (self.skip_bias_add and self.bias is not None)
-                else None
-            )
-            return output, output_bias
+            return output, None
 
         if (
             self.allreduce_dgrad
@@ -1550,6 +1681,12 @@ class RowParallelLinear(paddle.nn.Layer):
             - output
             - bias
         """
+
+        if getattr(self.config, "gpt_model_use_experimental_version", False):
+            output = row_sequence_parallel_linear(
+                input_, self.weight, self.bias, mp_group=self.tp_group
+            )
+            return output, None
 
         # Set up backprop all-reduce.
         if (

@@ -58,7 +58,17 @@ if TYPE_CHECKING:
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
+def print_tensor(message="", x=None): 
+    pass
+    # print(f"\nprint_tensor {x.name}")
+    # print(f"[local  {message}] {x.shape} {x.dtype} {x._md5sum()} norm={x.norm().item()} max={x.abs().max().item()} sum={x.sum().item()}")
+    # x.register_hook(print_grad(x.name, message))
 
+def print_grad(forward_name, message=""):
+    def _print_grad(grad):
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {grad.shape} {grad.dtype} {grad._md5sum()} norm={grad.norm().item()} max={grad.abs().max().item()} sum={grad.sum().item()}")
+    return _print_grad
 
 def tensors_clone(outputs):
     """
@@ -740,7 +750,7 @@ class TransformerLayer(nn.Layer):
                 return True
             else:
                 return True
-
+        print_tensor("[wxz debug] hidden_states: ", hidden_states)
         timer_name = "moe-mlp" if isinstance(self.mlp, MoELayer) else "mlp"
         if self.config.block_attention_residuals:
             blocks = kwargs.get("blocks", [])

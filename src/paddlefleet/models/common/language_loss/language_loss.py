@@ -328,6 +328,7 @@ class LanguageLoss(FleetLayer):
             )
             loss = sb_loss_func(logits, labels)
         else:
+            logits = logits.reshape([2, 2048, logits.shape[-1]])
             loss = self.loss_func(logits.cast("float32"), labels)
 
         if get_context_parallel_world_size() > 1:
@@ -476,7 +477,7 @@ class LanguageLoss(FleetLayer):
                                 axis=1,
                                 mode=self.config.cp_balance_mode,
                             )
-
+                        logits_cur_depth = logits_cur_depth.reshape([2, 2048, logits_cur_depth.shape[-1]])
                         if self.config.fused_linear_ce_loss_chunk > 0:
                             loss_matrix_cur_depth = self._forward(
                                 logits_cur_depth,
@@ -678,6 +679,7 @@ class LanguageLoss(FleetLayer):
 
             return loss
         else:
+            assert 0
             return self._forward(logits, labels)
 
     def build_schedule_node(self):

@@ -29,6 +29,7 @@ from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     AllGatherOp,
     mark_as_sequence_parallel_parameter,
 )
+from ernie_core.models.sequence_parallel_utils import GatherOp as ErnieGatherOp
 
 if TYPE_CHECKING:
     from paddlefleet.process_groups_config import ProcessGroupCollection
@@ -44,7 +45,7 @@ from paddlefleet.context_parallel_utils import (
     ContextParallelGatherOp,
     ContextParallelScatterOp,
 )
-from paddlefleet.parallel_state import get_context_parallel_world_size
+from paddlefleet.parallel_state import get_context_parallel_world_size, get_tensor_model_parallel_group
 from paddlefleet.transformer.moe.moe_utils import apply_random_logits
 
 # MD5 logging for MoE router precision debugging
@@ -422,8 +423,33 @@ class StandardMoERouter(nn.Layer):
                     [-1, local_seq_len, self.num_experts]
                 )
             batch_size = all_probs.shape[0]
-            # [B, S, E]
-            routing_map = routing_map.reshape([batch_size, seq_len, -1])
+            print(
+                f"[Fleet seq_aux pre] routing_map_local:{list(routing_map.shape)} {routing_map.dtype} "
+                f"md5={routing_map._md5sum()} first4rows=\n{routing_map[:4].numpy()}"
+            )
+            # [B, S, E]: align with EC by GatherOp + split on routing_map
+            if self.sequence_parallel and self.tensor_model_parallel_size > 1:
+                tp_group = get_tensor_model_parallel_group()
+                # all-gather routing_map across TP group, then split back to local rank
+                # to ensure consistent token ordering with EC's DeepEPTop2Gate
+                routing_map_gathered = ErnieGatherOp.apply(routing_map, 0, tp_group).reshape(
+                    [-1, seq_len * self.tensor_model_parallel_size, routing_map.shape[-1]]
+                )
+                print(
+                    f"[Fleet seq_aux pre] routing_map_gathered:{list(routing_map_gathered.shape)} "
+                    f"{routing_map_gathered.dtype} md5={routing_map_gathered._md5sum()}"
+                )
+                routing_map = paddle.split(
+                    routing_map_gathered,
+                    num_or_sections=self.tensor_model_parallel_size,
+                    axis=1,
+                )[tp_group.rank]
+                print(
+                    f"[Fleet seq_aux pre] routing_map_split:{list(routing_map.shape)} {routing_map.dtype} "
+                    f"md5={routing_map._md5sum()} first4rows=\n{routing_map[0,:4].numpy()}"
+                )
+            else:
+                routing_map = routing_map.reshape([batch_size, seq_len, -1])
             max_seq_len = local_seq_len
         else:
             # [B, S, E]
@@ -496,6 +522,11 @@ class StandardMoERouter(nn.Layer):
             seq_aux_loss = (
                 (cost_coeff * all_probs.mean(axis=seq_axis)).sum(axis=1).mean()
             )
+            print(f"[Fleet seq_aux] routing_map:{list(routing_map.shape)} md5={routing_map._md5sum()} "
+                  f"all_probs:{list(all_probs.shape)} md5={all_probs._md5sum()} "
+                  f"denom:{list(denom.shape)} md5={denom._md5sum()} "
+                  f"cost_coeff:{list(cost_coeff.shape)} md5={cost_coeff._md5sum()} "
+                  f"seq_aux_loss={seq_aux_loss.item()}")
         else:
             # [B, E]
             cost_coeff = routing_map.sum(axis=seq_axis, dtype="float32") / (
@@ -550,23 +581,18 @@ class StandardMoERouter(nn.Layer):
             )
             loss_mask = (input_ids != pad_token_id).astype(paddle.float32)
             loss_mask = loss_mask.reshape([-1])
-            if getattr(
-                self.config, "gpt_model_use_experimental_version", False
-            ):
-                # Align to EC, which also consider mtp token
-                denom = (
-                    origin_loss_mask.sum()
-                    + origin_loss_mask.shape[0]
-                    * self.config.num_nextn_predict_layers
-                )
-            else:
-                denom = origin_loss_mask.sum()
+            denom = origin_loss_mask.sum()
 
             l_zloss = (
                 logits.logsumexp(1).square() * loss_mask
             ).sum() / paddle.clip(denom, min=1e-6)
+            print(f"[Fleet z_loss] logits:{list(logits.shape)} {logits.dtype} md5={logits._md5sum()} "
+                  f"loss_mask:{list(loss_mask.shape)} md5={loss_mask._md5sum()} "
+                  f"origin_loss_mask:{list(origin_loss_mask.shape)} md5={origin_loss_mask._md5sum()} "
+                  f"denom={denom.item()} l_zloss={l_zloss.item()}")
         else:
             l_zloss = paddle.logsumexp(logits, axis=1).square().mean()
+            print(f"[Fleet z_loss] no_input_ids logits:{list(logits.shape)} {logits.dtype} md5={logits._md5sum()} l_zloss={l_zloss.item()}")
 
         return l_zloss
 
@@ -979,6 +1005,9 @@ class TopKRouter(StandardMoERouter):
                 batch_size, seq_len, d_model = input.shape
             else:
                 seq_len, batch_size, d_model = input.shape
+            batch_size = 2
+            seq_len = 2048
+            batch_size, seq_len, d_model = input.shape
             input = input.reshape([-1, d_model])
             if (
                 get_context_parallel_world_size() > 1
@@ -1005,16 +1034,16 @@ class TopKRouter(StandardMoERouter):
                 pad_token_id = getattr(self.config, "pad_token_id", 0)
                 if pad_token_id is None:
                     pad_token_id = 0
-                if self.sequence_parallel:
-                    input_ids_none_zero_mask = (
-                        (input_ids != pad_token_id)
-                        .transpose([1, 0])
-                        .reshape([-1, 1])
-                    )
-                else:
-                    input_ids_none_zero_mask = (
-                        input_ids != pad_token_id
-                    ).reshape([-1, 1])
+                # if self.sequence_parallel:
+                #     input_ids_none_zero_mask = (
+                #         (input_ids != pad_token_id)
+                #         .transpose([1, 0])
+                #         .reshape([-1, 1])
+                #     )
+                # else:
+                input_ids_none_zero_mask = (
+                    input_ids != pad_token_id
+                ).reshape([-1, 1])
                 batch_size_, seq_len_ = input_ids.shape
                 assert (batch_size_ == batch_size) and (seq_len_ == seq_len), (
                     f"input_ids shape mismatch with input: "
@@ -1024,9 +1053,39 @@ class TopKRouter(StandardMoERouter):
             else:
                 input_ids_none_zero_mask = None
         elif len(input.shape) == 2:
-            raise ValueError(
-                "The input tensor should have shape [batch_size, sequence_length, hidden_size]"
-            )
+            batch_size = 2
+            seq_len = 1024
+            if (
+                get_context_parallel_world_size() > 1
+                and self.config.experimental_dataflow
+                and input_ids is not None
+            ):
+                # In EB dataflow, shape of input_ids [b, s],
+                # but shape of input is [b, s/cp, h] ([s/cp, b, h] in sp),
+                # so we need to scatter input_ids here to avid the assertion below
+                input_ids = ContextParallelScatterOp.apply(
+                    input_ids, axis=1, mode=self.config.cp_balance_mode
+                )
+            if (
+                input_ids is not None
+                and self.sequence_parallel
+                and self.config.experimental_dataflow
+            ):
+                # SP: input_ids [b, s/cp] -> [b, s/(cp*tp)]
+                b, s = input_ids.shape
+                input_ids = ScatterOp.apply(input_ids.reshape([-1])).reshape(
+                    [b, -1]
+                )
+            if input_ids is not None:
+                input_ids_none_zero_mask = (input_ids != 0).reshape([-1, 1])
+                batch_size_, seq_len_ = input_ids.shape
+                assert (batch_size_ == batch_size) and (seq_len_ == seq_len), (
+                    f"input_ids shape mismatch with input: "
+                    f"input_ids=[{batch_size_}, {seq_len_}], "
+                    f"expected [batch_size={batch_size}, seq_len={seq_len}]"
+                )
+            else:
+                input_ids_none_zero_mask = None
 
         # Hash routing requires input_ids; verify early.
         if self.is_hash_layer and input_ids is None:

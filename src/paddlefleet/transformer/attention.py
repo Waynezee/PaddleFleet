@@ -135,8 +135,9 @@ def _apply_ec_complex_3d_mrope(
         freqs_cis = ContextParallelScatterOp.apply(
             freqs_cis, axis=1, mode=cp_balance_mode
         )
-    if get_tensor_model_parallel_world_size() > 1:
-        freqs_cis = freqs_cis.transpose(1, 0)
+    # if get_tensor_model_parallel_world_size() > 1:
+    #     freqs_cis = freqs_cis.transpose(1, 0)
+
     if _LOG_LAYER_MD5:
         logger = logging.getLogger(__name__)
         rank = paddle.distributed.get_rank()
@@ -531,6 +532,7 @@ class Attention(FleetLayer, ABC):
         # relative positional embedding (rotary embedding)
         # ================================================
         if self.qk_rope_head_dim > 0 and self.qk_rope_head_dim < self.head_dim:
+            assert 0
             query, query_nope = query.split(
                 [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
                 axis=-1,
@@ -546,6 +548,9 @@ class Attention(FleetLayer, ABC):
             and not self.config.multi_latent_attention
         ):
             # EC-compatible complex multiplication 3D MRoPE
+            # query = query.transpose([1, 0, 2, 3]).contiguous()
+            # key = key.transpose([1, 0, 2, 3]).contiguous()
+            # value = value.transpose([1, 0, 2, 3]).contiguous()
             query, key = _apply_ec_complex_3d_mrope(
                 query,
                 key,
@@ -656,6 +661,7 @@ class Attention(FleetLayer, ABC):
                     )
 
         if self.qk_rope_head_dim > 0 and self.qk_rope_head_dim < self.head_dim:
+            assert 0
             query = paddle.concat([query, query_nope], axis=-1)
             key = paddle.concat([key, key_nope], axis=-1)
 
@@ -667,9 +673,6 @@ class Attention(FleetLayer, ABC):
         # transpose back to [b, seq, h] for attention computation
         # TODO: supports [seq, b, h] input in attention computation
         if self.config.sequence_parallel:
-            query = query.transpose([1, 0, 2, 3]).contiguous()
-            key = key.transpose([1, 0, 2, 3]).contiguous()
-            value = value.transpose([1, 0, 2, 3]).contiguous()
             # Slice and adjust attn_mask_startend_row_indices for the local SP sequence
             # range. The full mask has shape [B, 1, S, 1] with absolute row indices.
             # Each SP rank processes key/query positions [tp_rank*L : (tp_rank+1)*L],
@@ -728,8 +731,8 @@ class Attention(FleetLayer, ABC):
         # Output. [b, sq, h]
         # =================
 
-        if self.config.sequence_parallel:
-            core_attn_out = core_attn_out.transpose([1, 0, 2]).contiguous()
+        # if self.config.sequence_parallel:
+        #     core_attn_out = core_attn_out.transpose([1, 0, 2]).contiguous()
 
         core_attn_out = self._post_core_attention_hook(core_attn_out)
 
@@ -756,6 +759,8 @@ class Attention(FleetLayer, ABC):
             logging.getLogger(__name__).info(
                 f"[MD5 Probe PF] Rank={_rank} Layer={self.layer_number} core_attn_out MD5={_ca_md5} shape={list(core_attn_out.shape)}"
             )
+        if self.config.sequence_parallel:
+            core_attn_out = core_attn_out.reshape([-1, core_attn_out.shape[-1]])
         if (
             self.config.gpt_model_use_experimental_version
             and self.o_proj.bias is not None
@@ -936,6 +941,7 @@ class SelfAttention(Attention):
                     if isinstance(gate_output, tuple)
                     else gate_output
                 )
+                gate = gate.reshape([2, 2048, -1])
             else:
                 gate = None
 
@@ -961,7 +967,7 @@ class SelfAttention(Attention):
                 split_arg_list = [num_heads, num_kv_heads, num_kv_heads]
                 return mixed_qkv, split_arg_list
             query, key, value = paddle.split(
-                mixed_qkv, [num_heads, num_kv_heads, num_kv_heads], axis=2
+                mixed_qkv.reshape([2, 2048, -1, 128]), [num_heads, num_kv_heads, num_kv_heads], axis=2
             )
         else:
             if self.gated_attention:

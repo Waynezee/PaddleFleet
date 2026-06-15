@@ -46,6 +46,17 @@ if TYPE_CHECKING:
     from paddlefleet.packed_seq_params import PackedSeqParams
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
+def print_tensor(message="", x=None): 
+    pass
+    # print(f"\nprint_tensor {x.name}")
+    # print(f"[local  {message}] {x.shape} {x.dtype} {x._md5sum()} norm={x.norm().item()} max={x.abs().max().item()} sum={x.sum().item()}")
+    # x.register_hook(print_grad(x.name, message))
+
+def print_grad(forward_name, message=""):
+    def _print_grad(grad):
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {grad.shape} {grad.dtype} {grad._md5sum()} norm={grad.norm().item()} max={grad.abs().max().item()} sum={grad.sum().item()}")
+    return _print_grad
 
 @dataclass
 class GPTEmbeddingSpec:
@@ -234,6 +245,7 @@ class GPTEmbedding(FleetLayer):
                     decoder_input = decoder_input[
                         :, : -self.config.num_nextn_predict_layers, :
                     ]
+                    print_tensor("[wxz debug] decoder_input before CP: ", decoder_input)
 
                     # Apply the same SP scatter as the non-magic-send path to ensure
                     # bit-for-bit identical main embedding output.
@@ -246,7 +258,8 @@ class GPTEmbedding(FleetLayer):
                             axis=1,
                             mode=self.config.cp_balance_mode,
                         )
-
+                    decoder_input = decoder_input.astype(self.embedding.embed_tokens.weight.dtype)
+                    print_tensor("[wxz debug] decoder_input after sp scatter: ", decoder_input)
                     if self.sequence_parallel:
                         batch_size, seq_length, hidden_size = (
                             decoder_input.shape
@@ -255,11 +268,13 @@ class GPTEmbedding(FleetLayer):
                             [-1, decoder_input.shape[-1]]
                         )
                         decoder_input = ScatterOp.apply(decoder_input)
-                        decoder_input = (
-                            decoder_input.reshape([batch_size, -1, hidden_size])
-                            .permute(1, 0, 2)
-                            .contiguous()
-                        )  # change to [S/tp, B, H]
+                        print_tensor("[wxz debug] decoder_input after SP: ", decoder_input)
+                        # decoder_input = (
+                        #     decoder_input.reshape([batch_size, -1, hidden_size])
+                        #     .permute(1, 0, 2)
+                        #     .contiguous()
+                        # )  # change to [S/tp, B, H]
+                    print_tensor("[wxz debug] decoder_input after SP: ", decoder_input)
                 else:
                     inputs_embeds_extra = decoder_input[
                         :, -self.config.num_nextn_predict_layers :, :
